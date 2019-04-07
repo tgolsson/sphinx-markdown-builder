@@ -3,17 +3,17 @@ from docutils.io import StringOutput
 from io import open
 from os import path
 from sphinx.builders import Builder
-from sphinx.builders import Builder
 from sphinx.locale import __
 from sphinx.util import logging
 from sphinx.util.osutil import ensuredir, os_path
 
-if False:
-    from typing import Any, Dict, Iterator, Set, Tuple
-    from docutils import nodes
-    from sphinx.application import Sphinx
+# if False:
+#     from typing import Any, Dict, Iterator, Set, Tuple
+#     from docutils import nodes
+#     from sphinx.application import Sphinx
 
 logger = logging.getLogger(__name__)
+
 
 class MarkdownBuilder(Builder):
     name = 'markdown'
@@ -49,7 +49,8 @@ class MarkdownBuilder(Builder):
                 pass
 
     def get_target_uri(self, docname, typ=None):
-        return ''
+        # type: (unicode, unicode) -> unicode
+        return docname + self.out_suffix
 
     def prepare_writing(self, docnames):
         self.writer = MarkdownWriter(self)
@@ -59,7 +60,9 @@ class MarkdownBuilder(Builder):
         self.secnumbers = self.env.toc_secnumbers.get(docname, {})
         destination = StringOutput(encoding='utf-8')
         self.writer.write(doctree, destination)
-        outfilename = path.join(self.outdir, os_path(docname) + self.out_suffix)
+
+        new_name = os_path(docname) + self.out_suffix
+        outfilename = path.join(self.outdir, new_name)
         ensuredir(path.dirname(outfilename))
         try:
             with open(outfilename, 'w', encoding='utf-8') as f:  # type: ignore
