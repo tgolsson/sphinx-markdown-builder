@@ -1,3 +1,4 @@
+import posixpath
 from .doctree2md import Translator, Writer
 from docutils import nodes
 from pydash import _
@@ -5,8 +6,76 @@ import html2text
 
 h = html2text.HTML2Text()
 
-import os
-import sys
+
+class PreMan:
+    '''
+    Utility class for managing quote/unquote operations. This is primarily
+    used to prevent accidentally leaving pre-mode when nesting, and also
+    to escape formatting when in quoted mode.
+    '''
+    def __init__(self, translator):
+        self._in_quotes = 0
+        self.translator = translator
+
+    def push(self):
+        '''
+        Push a quote, which will insert a quote if we're not in quoted mode,
+        otherwise it'll just increase the counter of quote-nestings.
+        '''
+        if self._in_quotes == 0:
+            self.translator.add('`')
+        self._in_quotes += 1
+
+    def pop(self):
+        '''
+        Pop one nesting from the quote-counter. If this was the last element in
+        the stack, it'll insert a backtick to end pre-formatted mode.
+        '''
+        self._in_quotes -= 1
+        if self._in_quotes == 0:
+            self.translator.add('`')
+
+    def escape(self, text: str):
+        '''
+        Append *text* to the document output. If we're currently in
+        pre-formatted mode this'll wrap *text* in `` ` ``'s so the
+        formatting is applied correctly.
+
+        :param text str: The text to escape
+        :returns: None
+        '''
+        if self._in_quotes:
+            self.translator.add('`{}`'.format(text))
+        else:
+            self.translator.add(text)
+
+
+def reformat_title(node: nodes.Text):
+    '''
+    Attempts to change the contents of *node* to move a potential 'module'
+    to the beginning from the end. This fixes an issue with markdown,
+    where for Python the links (`refuri`) do not match up with the
+    automatically generated anchors from Markdown.
+
+    In particular, the headings for a module will be:
+
+    `mypackage.mymodule module`
+
+    Which becomes the anchor `mypackagemymodule-module` while the generated
+    link will target `module-mypackage.mymodule`. This is incorrect both with
+    handling dots and the position of the `module`.
+
+    This does half of the corrective tranformation, while visit_reference
+    removes the dots in the url.
+
+    :param node nodes.Text: The node to transform
+    '''
+    if isinstance(node.children[0], nodes.Text):
+        textnode = node.children[0]
+        if 'module' in textnode:
+            cleaned = textnode.replace('module', '').strip()
+            node.children[0] = nodes.Text('Module ' + cleaned)
+
 
 class MarkdownTranslator(Translator):
     row_entries = []
@@ -16,8 +85,11 @@ class MarkdownTranslator(Translator):
     theads = []
 
     def __init__(self, document, builder=None):
-        Translator.__init__(self, document, builder=None)
+        Translator.__init__(self, document, builder)
         self.builder = builder
+        self.definining_class = None
+
+        self._quotes = PreMan(self)
 
     @property
     def rows(self):
@@ -33,81 +105,200 @@ class MarkdownTranslator(Translator):
                         rows.append(node)
         return rows
 
-    def visit_document(self, node):
-        pass
-
-    def depart_document(self, node):
-        pass
-
     def visit_title(self, node):
+        reformat_title(node)
         self.add((self.section_level) * '#' + ' ')
 
     def depart_title(self, node):
         super(MarkdownTranslator, self).depart_title(node)
 
     def visit_desc(self, node):
-        pass
+        self.add('<dl>')
 
     def depart_desc(self, node):
-        pass
+        self.add('</dl>\n\n')
 
     def visit_desc_annotation(self, node):
-        # annotation, e.g 'method', 'class'
-        pass
+        # if not node.astext().startswith('static'):
+        self._quotes.escape(' _')
+        self.add(node.astext().strip())
+        raise nodes.SkipChildren()
+        # if '=' not in node.astext():
+        #     raise nodes.SkipNode()
 
     def depart_desc_annotation(self, node):
         # annotation, e.g 'method', 'class'
+        # self.add(node.astext().strip())
+        self._quotes.escape('_ ')
         pass
 
     def visit_desc_addname(self, node):
         # module preroll for class/method
-        pass
+        self._quotes.push()
 
     def depart_desc_addname(self, node):
         # module preroll for class/method
-        pass
+        self._quotes.pop()
 
     def visit_desc_name(self, node):
         # name of the class/method
-        pass
+        self._quotes.escape('**')
+        self._quotes.push()
 
     def depart_desc_name(self, node):
+        self._quotes.pop()
+        self._quotes.escape('**')
         # name of the class/method
-        self.add("(")
 
     def visit_desc_content(self, node):
         # the description of the class/method
-        pass
+        self.add('<dd>\n\n')
+        # if node.astext() == '':
+        #     self.add('*no description*')
 
     def depart_desc_content(self, node):
         # the description of the class/method
+        self.add('</dd>')
+        self.add('\n\n\n')
+
+    def visit_definition_list(self, node):
+        self.add('<dl>\n')
+
+    def depart_definition_list(self, node):
+        self.add('</dl>\n\n')
+
+    def visit_definition_list_item(self, node):
+        pass
+
+    def depart_definition_list_item(self, node):
         pass
 
     def visit_desc_signature(self, node):
-        # the main signature of class/method
-        self.add("\n#### ")
+        self.add('<dt>\n\n')
+        if node.parent['objtype'] != 'describe' and node['ids'] and node['first']:
+            self.add('<!--[%s]-->' % node['ids'][0])
+
+    def visit_term(self, node):
+        self.add('<dt>')
+
+    def depart_term(self, node):
+        self.add('</dt>')
+
+    def visit_definition(self, node):
+        self.add('</dt>')
+        self.add('<dd>')
+        self.add('\n\n')
+        self.start_level('  ')
+
+    def depart_definition(self, node):
+        self.add('</dd>\n')
+        self.finish_level()
+
+    def _refuri2http(self, node):
+        url = node.get('refuri')
+        if not node.get('internal'):
+            return url
+
+        title = node.get('reftitle')
+        if url is None:
+            return '#' + title
+
+        this_doc = self.builder.current_docname
+        if url in (None, ''):  # Reference to this doc
+            url = self.builder.get_target_uri(this_doc)
+
+        else:  # URL is relative to the current docname.
+            this_dir = posixpath.dirname(this_doc)
+            if this_dir:
+                url = posixpath.normpath('{}/{}'.format(this_dir, url))
+
+        if 'refid' in node:
+            url += '#' + node['refid']
+
+        return url
+
+    def visit_reference(self, node):
+        # If no target possible, pass through.
+        document = self._refuri2http(node)
+        parts = document.split('#')
+        if len(parts) > 1:
+            parts[1] = parts[1].replace('.', '')
+            document = '#'.join(parts)
+        self.add('[{0}]({1})'.format(node.astext(), document))
+        raise nodes.SkipNode
 
     def depart_desc_signature(self, node):
-        # the main signature of class/method
-        self.add(")\n")
+        if not node.get('is_multiline'):
+            self.add('\n</dt>\n')
 
     def visit_desc_parameterlist(self, node):
+        self._quotes.push()
+        self.add('(')
         # method/class ctor param list
-        pass
 
     def depart_desc_parameterlist(self, node):
+        self.add(')')
+        self._quotes.pop()
         # method/class ctor param list
-        pass
 
     def visit_desc_parameter(self, node):
         # single method/class ctr param
-        pass
+        text = node.astext()
+        self._quotes.escape('_')
+        if ':' in text:
+            name, typ = text.split(':')
+            self.add(name.strip())
+            self._quotes.escape('_')
+            self.add(': ')
+            self._quotes.escape('__')
+            self.add(typ.strip())
+            self._quotes.escape('__')
+            if node.next_node(descend=False, siblings=True):
+                self.add(", ")
+
+            raise nodes.SkipNode
 
     def depart_desc_parameter(self, node):
         # single method/class ctr param
         # if there are additional params, include a comma
+        self._quotes.escape('_')
         if node.next_node(descend=False, siblings=True):
             self.add(", ")
+
+    def visit_desc_returns(self, node):
+        self.add(' → ')
+        self._quotes.escape('**')
+        self._quotes.push()
+
+    def depart_desc_returns(self, foo):
+        self._quotes.pop()
+        self._quotes.escape('**')
+
+    def visit_caption(self, node):
+        pass
+
+    def depart_caption(self, node):
+        self.add('\n')
+        pass
+
+    def visit_admonition(self, node):
+        '''
+        .. note::
+           The support for admonitions across Markdown is very inconsistent.
+
+        This function generates admonitions as a quoted block with a heading
+        derived from the admonition name. This is likely not the best for every
+        Markdown renderer. While for example GitHub does have some support, it
+        looks very basic.
+        '''
+        if node.children:
+            title = node.pop(0)
+            self.start_level('> ')
+            self.add('## ' + title.astext() + '  \n')
+
+    def depart_admonition(self, node):
+        if node.children:
+            self.finish_level()
 
     # list of parameters/return values/exceptions
     #
@@ -115,11 +306,26 @@ class MarkdownTranslator(Translator):
     #   field
     #       field_name (e.g 'returns/parameters/raises')
     #
+    def visit_description(self, node):
+        self.add('<dd>\n\n')
+
+    def depart_description(self, node):
+        self.add('</dd>')
+
+    def visit_field_body(self, node):
+        self.add('<dd>\n\n')
+        if not node.children:
+            self.add(' ')
+
+    def depart_field_body(self, node):
+        self.add('</dd>')
 
     def visit_field_list(self, node):
+        self.add('<dl>')
         pass
 
     def depart_field_list(self, node):
+        self.add('</dl>\n\n')
         pass
 
     def visit_field(self, node):
@@ -130,10 +336,10 @@ class MarkdownTranslator(Translator):
 
     def visit_field_name(self, node):
         # field name, e.g 'returns', 'parameters'
-        self.add("* **")
+        self.add('\n**<dt>')
 
     def depart_field_name(self, node):
-        self.add("**")
+        self.add('</dt>**\n')
 
     def visit_literal_strong(self, node):
         self.add("**")
@@ -330,6 +536,13 @@ class MarkdownTranslator(Translator):
                     length = entry_length
         padding = ''.join(_.map(range(length - len(node.astext())), lambda: ' '))
         self.add(padding + ' ')
+
+    def visit_strong(self, node):
+        self.add('<b>')
+
+    def depart_strong(self, node):
+        self.add('</b>')
+
 
 class MarkdownWriter(Writer):
     translator_class = MarkdownTranslator
